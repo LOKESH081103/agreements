@@ -1,0 +1,12 @@
+streamlit>=1.37,<2.0
+pandas>=2.2,<3.0
+SQLAlchemy>=2.0,<3.0
+psycopg2-binary>=2.9,<3.0
+python-dotenv>=1.0,<2.0
+plotly>=5.22,<6.0
+kaleido>=0.2.1,<0.3  # pinned below 1.0 on purpose: kaleido 1.x requires Chrome installed
+                     # on the server for PNG export; 0.2.x renders PNGs standalone, no
+                     # Chrome needed, which is what powers the in-app "Download Chart as
+                     # PNG" button. If this constraint is ever changed to >=1.0, either run
+                     # `plotly_get_chrome` once on the server, or rely on the chart's
+                     # built-in camera-icon export instead (works with any kaleido version).

@@ -20,6 +20,7 @@ from datetime import date
 from typing import Any
 
 import pandas as pd
+import plotly.express as px
 import streamlit as st
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import Engine
@@ -197,6 +198,42 @@ MONTH_NAMES = [
     "January", "February", "March", "April", "May", "June",
     "July", "August", "September", "October", "November", "December",
 ]
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_monthly_summary(
+    _engine: Engine, table_name: str, date_col: str, category_col: str | None = None
+) -> pd.DataFrame:
+    """
+    Aggregate row counts per calendar month based on `date_col`, optionally
+    broken down by a second column (e.g. payment_mode). A record dated
+    01-03-2024 is grouped under March 2024 regardless of the day of month —
+    this mirrors EXTRACT(MONTH FROM ...), same as the existing Month/Year
+    filter above.
+    """
+    if category_col:
+        query = text(
+            f'SELECT EXTRACT(YEAR FROM "{date_col}")::int AS yr, '
+            f'EXTRACT(MONTH FROM "{date_col}")::int AS mo, '
+            f'"{category_col}", '
+            f'COUNT(*) AS record_count '
+            f'FROM "public"."{table_name}" '
+            f'WHERE "{date_col}" IS NOT NULL '
+            f'GROUP BY yr, mo, "{category_col}" '
+            f'ORDER BY yr, mo'
+        )
+    else:
+        query = text(
+            f'SELECT EXTRACT(YEAR FROM "{date_col}")::int AS yr, '
+            f'EXTRACT(MONTH FROM "{date_col}")::int AS mo, '
+            f'COUNT(*) AS record_count '
+            f'FROM "public"."{table_name}" '
+            f'WHERE "{date_col}" IS NOT NULL '
+            f'GROUP BY yr, mo '
+            f'ORDER BY yr, mo'
+        )
+    with _engine.connect() as conn:
+        return pd.read_sql(query, conn)
 
 
 # --------------------------------------------------------------------------- #
@@ -411,67 +448,284 @@ with st.sidebar:
     )
 
     st.divider()
+    st.subheader("3️⃣ Monthly Cumulative Summary (optional)")
+    show_monthly_summary = st.checkbox(
+        "Show monthly cumulative summary",
+        value=False,
+        help=(
+            "Counts records per calendar month — a record dated 01-03-2024 is "
+            "counted as a March record. Optionally break it down by another "
+            "column, e.g. payment_mode (Cash / Cheque / DD)."
+        ),
+    )
+
+    summary_date_col: str | None = None
+    breakdown_col: str | None = None
+    focus_year_months: list[tuple[int, int]] = []
+    focus_categories: list[Any] = []
+
+    if show_monthly_summary:
+        date_columns = [c for c in column_names if column_kind_map.get(c) == "date"]
+        if not date_columns:
+            st.warning("No date/timestamp columns found in this table — can't build a monthly summary.")
+            show_monthly_summary = False
+        else:
+            default_date_col = ref_column if ref_kind == "date" and ref_column in date_columns else date_columns[0]
+            summary_date_col = st.selectbox(
+                "Date column to summarize by month",
+                options=date_columns,
+                index=date_columns.index(default_date_col),
+                key="summary_date_col",
+            )
+
+            breakdown_candidates = ["(None)"] + [c for c in column_names if c != summary_date_col]
+            breakdown_choice = st.selectbox(
+                "Breakdown by (optional) — e.g. payment_mode",
+                options=breakdown_candidates,
+                key="breakdown_choice",
+            )
+            breakdown_col = None if breakdown_choice == "(None)" else breakdown_choice
+
+            try:
+                available_ym_summary = get_available_year_months(engine, selected_table, summary_date_col)
+            except SQLAlchemyError as exc:
+                st.error(f"Failed to fetch available months: {exc}")
+                available_ym_summary = []
+            ym_labels_summary = {f"{MONTH_NAMES[mo - 1]} {yr}": (yr, mo) for yr, mo in available_ym_summary}
+            focus_labels = st.multiselect(
+                "Focus on specific month(s) — leave empty to see every month",
+                options=list(ym_labels_summary.keys()),
+                key="focus_months",
+            )
+            focus_year_months = [ym_labels_summary[lbl] for lbl in focus_labels]
+
+            if breakdown_col:
+                try:
+                    breakdown_values = get_distinct_values(engine, selected_table, breakdown_col)
+                except SQLAlchemyError as exc:
+                    st.error(f"Failed to fetch values for `{breakdown_col}`: {exc}")
+                    breakdown_values = []
+                focus_categories = st.multiselect(
+                    f"Focus on specific {breakdown_col} value(s) — e.g. Cash — leave empty for all",
+                    options=breakdown_values,
+                    key="focus_categories",
+                )
+
+    st.divider()
     run_clicked = st.button("🚀 Generate Report", type="primary", use_container_width=True)
 
 # --------------------------------------------------------------------------- #
-# Main panel - results
+# Main UI - Tabs Layout
 # --------------------------------------------------------------------------- #
-if not output_columns:
-    st.info("👈 Select at least one output column in the sidebar to build a report.")
-    st.stop()
+tab_report, tab_sql = st.tabs(["📊 Dynamic Report Builder", "🧑‍💻 Custom SQL Query"])
 
-if not run_clicked:
-    st.info("👈 Configure your filters and click **Generate Report** to run the query.")
-    st.stop()
+with tab_report:
+    # --------------------------------------------------------------------------- #
+    # Monthly Cumulative Summary (independent of the report section below)
+    # --------------------------------------------------------------------------- #
+    if show_monthly_summary and summary_date_col:
+        st.subheader("🗓️ Monthly Cumulative Summary")
+        st.caption(
+            f"Every record is counted under the calendar month of `{summary_date_col}` "
+            "— e.g. a record dated 01-03-2024 is counted as a **March** record, regardless of the day."
+        )
 
-query, params = build_query(selected_table, ref_column, output_columns, ref_kind, filter_payload)
+        try:
+            with st.spinner("Building monthly summary..."):
+                summary_df = get_monthly_summary(engine, selected_table, summary_date_col, breakdown_col)
+        except SQLAlchemyError as exc:
+            st.error(f"❌ Failed to build monthly summary: {exc}")
+            summary_df = pd.DataFrame()
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"❌ Unexpected error while building monthly summary: {exc}")
+            summary_df = pd.DataFrame()
 
-with st.expander("🔍 View generated SQL", expanded=False):
-    st.code(query, language="sql")
-    if params:
-        st.caption("Parameters:")
-        st.json({k: str(v) for k, v in params.items()})
+        if summary_df.empty:
+            st.info("No data available to summarize for this date column.")
+        else:
+            summary_df["month_label"] = summary_df.apply(
+                lambda r: f"{MONTH_NAMES[int(r['mo']) - 1]} {int(r['yr'])}", axis=1
+            )
+            summary_df = summary_df.sort_values(["yr", "mo"])
 
-try:
-    with st.spinner("Running query..."):
-        df = run_query(engine, query, params)
-except SQLAlchemyError as exc:
-    st.error(f"❌ Query failed: {exc}")
-    st.stop()
-except Exception as exc:  # noqa: BLE001
-    st.error(f"❌ Unexpected error while running the query: {exc}")
-    st.stop()
+            # Apply optional focus filters chosen in the sidebar
+            display_df = summary_df.copy()
+            if focus_year_months:
+                focus_set = set(focus_year_months)
+                display_df = display_df[
+                    display_df.apply(lambda r: (int(r["yr"]), int(r["mo"])) in focus_set, axis=1)
+                ]
+            if breakdown_col and focus_categories:
+                display_df = display_df[display_df[breakdown_col].isin(focus_categories)]
 
-st.success(f"Query returned **{len(df):,}** row(s).")
+            if display_df.empty:
+                st.warning("No records match the selected month/category focus. Try widening your focus selections.")
+            elif breakdown_col:
+                # --- Grouped comparison chart: month x category ---
+                fig = px.bar(
+                    display_df,
+                    x="month_label",
+                    y="record_count",
+                    color=breakdown_col,
+                    barmode="group",
+                    template="plotly_white",
+                    labels={"month_label": "Month", "record_count": "Count"},
+                    title=f"Records per month by {breakdown_col}",
+                )
+                fig.update_layout(xaxis_title="Month", yaxis_title="Count")
+                st.plotly_chart(fig, use_container_width=True)
 
-# --- KPI cards for numeric output columns ---------------------------------
-numeric_output_cols = [
-    c for c in output_columns
-    if c in df.columns and pd.api.types.is_numeric_dtype(df[c])
-]
+                # --- Excel-style pivot: rows = month, columns = category ---
+                pivot_df = display_df.pivot_table(
+                    index="month_label",
+                    columns=breakdown_col,
+                    values="record_count",
+                    aggfunc="sum",
+                    fill_value=0,
+                    margins=True,
+                    margins_name="Total",
+                )
+                month_order = [
+                    m for m in display_df.sort_values(["yr", "mo"])["month_label"].unique() if m in pivot_df.index
+                ]
+                if "Total" in pivot_df.index:
+                    month_order.append("Total")
+                pivot_df = pivot_df.reindex(month_order)
+                st.dataframe(pivot_df, use_container_width=True)
 
-if numeric_output_cols:
-    st.subheader("📈 KPI Summary")
-    for col in numeric_output_cols:
-        series = df[col].dropna()
-        c1, c2, c3 = st.columns(3)
-        c1.metric(f"Total Sum — {col}", f"{series.sum():,.2f}")
-        c2.metric(f"Average — {col}", f"{series.mean():,.2f}" if len(series) else "0.00")
-        c3.metric(f"Count — {col}", f"{series.count():,}")
-    st.divider()
+                summary_csv_buffer = io.StringIO()
+                pivot_df.to_csv(summary_csv_buffer)
+                st.download_button(
+                    "⬇️ Download Monthly Breakdown CSV",
+                    data=summary_csv_buffer.getvalue(),
+                    file_name=f"{selected_table}_monthly_{breakdown_col}_summary.csv",
+                    mime="text/csv",
+                    key="download_monthly_breakdown",
+                )
+            else:
+                # --- Simple month-over-month comparison ---
+                fig = px.bar(
+                    display_df,
+                    x="month_label",
+                    y="record_count",
+                    template="plotly_white",
+                    labels={"month_label": "Month", "record_count": "Count"},
+                    title="Records per month",
+                )
+                fig.update_layout(xaxis_title="Month", yaxis_title="Count")
+                st.plotly_chart(fig, use_container_width=True)
 
-# --- Data table -------------------------------------------------------------
-st.subheader("📋 Results")
-st.dataframe(df, use_container_width=True, height=450)
-st.caption(f"Total rows: **{len(df):,}** | Columns: {', '.join(df.columns)}")
+                if focus_year_months:
+                    cols = st.columns(min(len(display_df), 4) or 1)
+                    for i, (_, row) in enumerate(display_df.iterrows()):
+                        cols[i % len(cols)].metric(row["month_label"], f"{int(row['record_count']):,}")
 
-# --- Download button ---------------------------------------------------------
-csv_buffer = io.StringIO()
-df.to_csv(csv_buffer, index=False)
-st.download_button(
-    label="⬇️ Download CSV",
-    data=csv_buffer.getvalue(),
-    file_name=f"{selected_table}_report.csv",
-    mime="text/csv",
-    use_container_width=True,
-)
+                st.dataframe(
+                    display_df[["month_label", "record_count"]].rename(
+                        columns={"month_label": "Month", "record_count": "Count"}
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                summary_csv_buffer = io.StringIO()
+                display_df[["month_label", "record_count"]].to_csv(summary_csv_buffer, index=False)
+                st.download_button(
+                    "⬇️ Download Monthly Summary CSV",
+                    data=summary_csv_buffer.getvalue(),
+                    file_name=f"{selected_table}_monthly_summary.csv",
+                    mime="text/csv",
+                    key="download_monthly_summary",
+                )
+        st.divider()
+
+    # --------------------------------------------------------------------------- #
+    # Main panel - results
+    # --------------------------------------------------------------------------- #
+    if not output_columns:
+        st.info("👈 Select at least one output column in the sidebar to build a report.")
+    elif not run_clicked:
+        st.info("👈 Configure your filters and click **Generate Report** to run the query.")
+    else:
+        query, params = build_query(selected_table, ref_column, output_columns, ref_kind, filter_payload)
+
+        with st.expander("🔍 View generated SQL", expanded=False):
+            st.code(query, language="sql")
+            if params:
+                st.caption("Parameters:")
+                st.json({k: str(v) for k, v in params.items()})
+
+        try:
+            with st.spinner("Running query..."):
+                df = run_query(engine, query, params)
+                
+            st.success(f"Query returned **{len(df):,}** row(s).")
+
+            # --- KPI cards for numeric output columns ---
+            numeric_output_cols = [
+                c for c in output_columns
+                if c in df.columns and pd.api.types.is_numeric_dtype(df[c])
+            ]
+
+            if numeric_output_cols:
+                st.subheader("📈 KPI Summary")
+                for col in numeric_output_cols:
+                    series = df[col].dropna()
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric(f"Total Sum — {col}", f"{series.sum():,.2f}")
+                    c2.metric(f"Average — {col}", f"{series.mean():,.2f}" if len(series) else "0.00")
+                    c3.metric(f"Count — {col}", f"{series.count():,}")
+                st.divider()
+
+            # --- Data table ---
+            st.subheader("📋 Results")
+            st.dataframe(df, use_container_width=True, height=450)
+            st.caption(f"Total rows: **{len(df):,}** | Columns: {', '.join(df.columns)}")
+
+            # --- Download button ---
+            csv_buffer = io.StringIO()
+            df.to_csv(csv_buffer, index=False)
+            st.download_button(
+                label="⬇️ Download CSV",
+                data=csv_buffer.getvalue(),
+                file_name=f"{selected_table}_report.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+        except SQLAlchemyError as exc:
+            st.error(f"❌ Query failed: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"❌ Unexpected error while running the query: {exc}")
+
+with tab_sql:
+    st.subheader("🧑‍💻 Custom SQL Execution")
+    st.info("Write and execute standard PostgreSQL queries directly against your database.")
+    
+    # Text area for the user to type queries
+    custom_query = st.text_area("SQL Query", height=200, placeholder='SELECT * FROM "public"."agreements" LIMIT 100;')
+    
+    if st.button("▶️ Run Custom Query", type="primary"):
+        if custom_query.strip():
+            try:
+                with st.spinner("Executing query..."):
+                    with engine.connect() as conn:
+                        # Uses the existing engine to run the custom text query
+                        custom_df = pd.read_sql(text(custom_query), conn)
+                
+                st.success(f"Query returned **{len(custom_df):,}** row(s).")
+                st.dataframe(custom_df, use_container_width=True, height=400)
+                
+                # Dynamic CSV Download for Custom Queries
+                custom_csv = io.StringIO()
+                custom_df.to_csv(custom_csv, index=False)
+                st.download_button(
+                    label="⬇️ Download Custom Results (CSV)",
+                    data=custom_csv.getvalue(),
+                    file_name="custom_sql_results.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+            except Exception as exc:
+                st.error(f"❌ Query failed: {exc}")
+        else:
+            st.warning("Please enter a SQL query first.")

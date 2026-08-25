@@ -508,38 +508,473 @@ def fetch_pivot_source_data(
     with _engine.connect() as conn:
         return pd.read_sql(text(query), conn, params=params)
 
-def format_hierarchical_pivot(pivot_df: pd.DataFrame) -> pd.DataFrame:
+def _expand_date_fields(
+    df: pd.DataFrame,
+    fields: list[str],
+    column_kind_map: dict[str, str],
+    label_map: dict[tuple[str, Any], str],
+) -> tuple[pd.DataFrame, list[str]]:
     """
-    Transforms a MultiIndex row pivot table into an indented hierarchical tree.
-    Merges multiple row dimensions into a single unified column where sub-options
-    appear below and indented under parent categories.
+    Mirrors Excel's automatic date grouping: if a chosen Rows/Columns field is
+    a date/timestamp column, split it into two synthetic sortable levels —
+    'YYYY-MM' (displayed as 'Mon-YY') and 'YYYY-MM-DD' (displayed as
+    'DD-Mon-YY') — so a single date field automatically produces the same
+    Month > Date nesting Excel shows when you drop a date into the
+    PivotTable. The synthetic fields sort correctly because 'YYYY-MM' /
+    'YYYY-MM-DD' strings sort lexically the same as chronologically;
+    `label_map` carries the pretty text shown to the user for each raw key.
     """
-    if not isinstance(pivot_df.index, pd.MultiIndex):
-        return pivot_df
+    work_df = df.copy()
+    expanded: list[str] = []
+    for f in fields:
+        if column_kind_map.get(f) == "date":
+            ts = pd.to_datetime(work_df[f], errors="coerce")
+            month_field, date_field = f"__{f}__month", f"__{f}__date"
+            work_df[month_field] = ts.dt.strftime("%Y-%m")
+            work_df[date_field] = ts.dt.strftime("%Y-%m-%d")
 
-    df = pivot_df.copy()
-    formatted_index = []
+            month_keys = work_df[month_field].dropna().unique()
+            if len(month_keys):
+                for k, disp in zip(month_keys, pd.to_datetime(month_keys).strftime("%b-%y")):
+                    label_map[(month_field, k)] = disp
+            date_keys = work_df[date_field].dropna().unique()
+            if len(date_keys):
+                for k, disp in zip(date_keys, pd.to_datetime(date_keys).strftime("%d-%b-%y")):
+                    label_map[(date_field, k)] = disp
 
-    for idx in df.index:
-        # Keep 'Total' margin row clean
-        if "Total" in idx:
-            formatted_index.append("Total")
-            continue
+            expanded.extend([month_field, date_field])
+        else:
+            expanded.append(f)
+    return work_df, expanded
 
-        # Build indented hierarchy label for child levels
-        row_str = str(idx[0])
-        for level in range(1, len(idx)):
-            val = idx[level]
-            if pd.notna(val) and str(val) != "":
-                indent = "   " * level + "↳ "
-                row_str += f"\n{indent}{val}"
 
-        formatted_index.append(row_str)
+def _pivot_agg_value(
+    df: pd.DataFrame,
+    value_col: str,
+    agg_func: str,
+    row_fields: list[str],
+    row_prefix: tuple[Any, ...],
+    col_fields: list[str],
+    col_prefix: tuple[Any, ...],
+) -> float:
+    """Aggregate value_col over exactly the rows matching row_prefix + col_prefix
+    (a *partial* prefix aggregates over every deeper level — this is what makes
+    subtotal cells correct for sum/mean/count/min/max alike)."""
+    mask = pd.Series(True, index=df.index)
+    for f, v in zip(row_fields, row_prefix):
+        mask &= df[f] == v
+    for f, v in zip(col_fields, col_prefix):
+        mask &= df[f] == v
+    subset = df.loc[mask, value_col].dropna()
+    if subset.empty:
+        return 0.0
+    if agg_func == "count":
+        return float(subset.count())
+    return float(getattr(subset, agg_func)())
 
-    # Name the combined single column header
-    combined_name = " > ".join([str(n) for n in df.index.names if n])
-    df.index = pd.Index(formatted_index, name=combined_name or "Hierarchy")
-    return df
+
+def _ordered_unique(series: pd.Series) -> list[Any]:
+    """Distinct non-null values, sorted when possible (falls back to first-seen order)."""
+    vals = [v for v in pd.unique(series) if pd.notna(v)]
+    try:
+        return sorted(vals)
+    except TypeError:
+        return vals
+
+
+def _build_row_entries(
+    df: pd.DataFrame,
+    row_fields: list[str],
+    label_map: dict[tuple[str, Any], str],
+    prefix: tuple[Any, ...] = (),
+    indent: int = 0,
+) -> list[dict[str, Any]]:
+    """
+    Excel-style row tree: a subtotal row for each parent group appears
+    BEFORE its children (e.g. 'EAST' subtotal, then 'EAST_1', 'EAST_2'
+    indented beneath it), recursing to arbitrary depth.
+    """
+    level = len(prefix)
+    if level >= len(row_fields):
+        return []
+    field = row_fields[level]
+    mask = pd.Series(True, index=df.index)
+    for f, v in zip(row_fields[:level], prefix):
+        mask &= df[f] == v
+    values = _ordered_unique(df.loc[mask, field])
+    is_last_level = level == len(row_fields) - 1
+
+    entries: list[dict[str, Any]] = []
+    for v in values:
+        new_prefix = prefix + (v,)
+        disp = label_map.get((field, v), str(v))
+        if is_last_level:
+            entries.append({"label": disp, "prefix": new_prefix, "indent": indent, "is_group": False})
+        else:
+            entries.append({"label": disp, "prefix": new_prefix, "indent": indent, "is_group": True})
+            entries.extend(_build_row_entries(df, row_fields, label_map, new_prefix, indent + 1))
+    return entries
+
+
+def _build_col_entries(
+    df: pd.DataFrame,
+    col_fields: list[str],
+    label_map: dict[tuple[str, Any], str],
+    prefix: tuple[Any, ...] = (),
+) -> list[dict[str, Any]]:
+    """
+    Excel-style column tree: a group's children come first, followed by that
+    group's own '<value> Total' subtotal column (e.g. Jun, Jun Total, Jul,
+    Jul Total, then STAGE_1 Total) — the mirror image of the row ordering.
+    """
+    level = len(prefix)
+    if level >= len(col_fields):
+        return []
+    field = col_fields[level]
+    mask = pd.Series(True, index=df.index)
+    for f, v in zip(col_fields[:level], prefix):
+        mask &= df[f] == v
+    values = _ordered_unique(df.loc[mask, field])
+    is_last_level = level == len(col_fields) - 1
+
+    entries: list[dict[str, Any]] = []
+    for v in values:
+        new_prefix = prefix + (v,)
+        if is_last_level:
+            disp = label_map.get((field, v), str(v))
+            entries.append({"label": disp, "prefix": new_prefix, "is_total": False})
+        else:
+            entries.extend(_build_col_entries(df, col_fields, label_map, new_prefix))
+            disp = label_map.get((field, v), str(v))
+            entries.append({"label": f"{disp} Total", "prefix": new_prefix, "is_total": True})
+    return entries
+
+
+def _pretty_prefix(
+    prefix: tuple[Any, ...], fields: list[str], label_map: dict[tuple[str, Any], str]
+) -> tuple[str, ...]:
+    """Map each raw value in a prefix tuple to its display label, one per field."""
+    return tuple(label_map.get((fields[i], v), str(v)) for i, v in enumerate(prefix))
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def build_excel_style_pivot(
+    source_df: pd.DataFrame,
+    row_cols: list[str],
+    col_cols: list[str],
+    value_col: str,
+    agg_func: str,
+    column_kind_map: dict[str, str],
+    in_crores: bool,
+    right_total_mode: str = "grand_total",
+) -> tuple[pd.DataFrame, list[bool], list[bool]]:
+    """
+    Build a true Excel-style PivotTable: per-level row AND column subtotals
+    (not just one grand-total margin), date fields auto-grouped into a
+    Month level above the exact date, and values optionally shown in
+    Crores. Returns (display_df, group_row_flags, total_col_flags) — the
+    two flag lists are positional (aligned to display_df's row/column
+    order), used only for highlighting subtotal/Total rows & columns.
+
+    `right_total_mode` controls what appears at the far right of the header
+    when 2+ Columns fields are selected (e.g. Stage > Month):
+      - "grand_total"        -> single overall "Grand Total" column (default,
+                                 original behaviour).
+      - "deepest_field_total" -> one "<value> Total" column per distinct value
+                                 of the *last* Columns field (e.g. one per
+                                 month), each summed across every other
+                                 Columns field (e.g. across all stages) --
+                                 no single overall Grand Total column.
+      - "both"                -> the per-deepest-field totals, followed by
+                                 one overall Grand Total at the very end.
+    With fewer than 2 Columns fields there's nothing to "sum across", so
+    this always falls back to the plain single Grand Total column.
+    """
+    label_map: dict[tuple[str, Any], str] = {}
+    work_df, row_fields = _expand_date_fields(source_df, row_cols, column_kind_map, label_map)
+    work_df, col_fields = _expand_date_fields(work_df, col_cols, column_kind_map, label_map)
+
+    row_entries = _build_row_entries(work_df, row_fields, label_map)
+    row_entries.append({"label": "Grand Total", "prefix": (), "indent": 0, "is_group": True, "is_grand_total": True})
+
+    if col_fields:
+        col_entries = _build_col_entries(work_df, col_fields, label_map)
+        col_depth = len(col_fields)
+
+        # Dynamic "per-deepest-field" totals (e.g. one "Jul-26 Total" column
+        # per month, summed across every Stage) -- only meaningful with 2+
+        # Columns fields; with just one field there's no "other" field left
+        # to sum across, so this list simply stays empty in that case.
+        deepest_field_entries: list[dict[str, Any]] = []
+        if right_total_mode in ("deepest_field_total", "both") and col_depth >= 2:
+            deepest_field = col_fields[-1]
+            for v in _ordered_unique(work_df[deepest_field]):
+                disp = label_map.get((deepest_field, v), str(v))
+                deepest_field_entries.append({
+                    "label": f"{disp} Total",
+                    "prefix": (v,),
+                    "is_total": True,
+                    # Aggregate by matching ONLY this field -- ignoring every
+                    # other Columns field entirely, which is what makes this
+                    # a total *across* stages rather than a per-stage subtotal.
+                    "mask_fields": [deepest_field],
+                })
+
+        # Fall back to (or additionally include) the classic single overall
+        # Grand Total column -- always included if the per-field totals
+        # above ended up empty for any reason (e.g. mode requested but only
+        # 1 Columns field was actually picked).
+        grand_total_entries: list[dict[str, Any]] = []
+        if right_total_mode in ("grand_total", "both") or not deepest_field_entries:
+            grand_total_entries = [{"label": "Grand Total", "prefix": (), "is_total": True, "is_grand_total": True}]
+
+        col_entries = col_entries + deepest_field_entries + grand_total_entries
+
+        col_tuples: list[tuple[str, ...]] = []
+        for ce in col_entries:
+            if ce.get("is_grand_total"):
+                tup = ("Grand Total",) + ("",) * (col_depth - 1)
+            elif ce.get("mask_fields"):
+                # Per-deepest-field total (e.g. "Jul-26 Total") -- shown as a
+                # single top-level header label, same visual treatment as
+                # Grand Total, since it cuts across every other Columns
+                # field rather than nesting under one specific value of them.
+                tup = (ce["label"],) + ("",) * (col_depth - 1)
+            else:
+                depth_used = len(ce["prefix"])
+                pretty = _pretty_prefix(ce["prefix"], col_fields[:depth_used], label_map)
+                if ce["is_total"]:
+                    pretty = pretty[:-1] + (f"{pretty[-1]} Total",)
+                tup = pretty + ("",) * (col_depth - len(pretty))
+            col_tuples.append(tup)
+        columns_index = pd.MultiIndex.from_tuples(col_tuples) if col_depth > 1 else pd.Index([t[0] for t in col_tuples])
+        total_col_flags = [bool(ce.get("is_total") or ce.get("is_grand_total")) for ce in col_entries]
+    else:
+        col_entries = [{"label": f"{agg_func.title()} of {value_col}", "prefix": (), "is_total": False}]
+        columns_index = pd.Index([col_entries[0]["label"]])
+        total_col_flags = [False]
+
+    divisor = CRORE if (in_crores and agg_func != "count") else 1
+
+    row_labels: list[str] = []
+    group_row_flags: list[bool] = []
+    data_rows: list[list[float]] = []
+    for re_ in row_entries:
+        indent_txt = "    " * re_["indent"]
+        if re_.get("is_grand_total"):
+            label = "Grand Total"
+        elif re_["is_group"]:
+            label = f"{indent_txt}{re_['label']}"
+        else:
+            # Only show the child-arrow when this row is actually nested under a
+            # parent group row (indent > 0). A single-level Rows selection has
+            # no parent, so it should read as a plain flat list, e.g. "EAST",
+            # not "↳ EAST".
+            arrow = "↳ " if re_["indent"] > 0 else ""
+            label = f"{indent_txt}{arrow}{re_['label']}"
+        row_labels.append(label)
+        group_row_flags.append(bool(re_["is_group"]))
+
+        row_vals = [
+            _pivot_agg_value(
+                work_df, value_col, agg_func, row_fields, re_["prefix"],
+                ce.get("mask_fields", col_fields), ce["prefix"],
+            ) / divisor
+            for ce in col_entries
+        ]
+        data_rows.append(row_vals)
+
+    display_df = pd.DataFrame(
+        data_rows,
+        index=pd.Index(row_labels, name=" / ".join(row_cols)),
+        columns=columns_index,
+    )
+    return display_df, group_row_flags, total_col_flags
+
+
+def render_excel_style_pivot_table(
+    source_df: pd.DataFrame,
+    row_cols: list[str],
+    col_cols: list[str],
+    value_col: str,
+    agg_func: str,
+    column_kind_map: dict[str, str],
+    in_crores: bool,
+    right_total_mode: str = "grand_total",
+) -> pd.DataFrame:
+    """Build the Excel-style nested pivot, render it (styled where possible), return it for CSV export."""
+    display_df, group_row_flags, total_col_flags = build_excel_style_pivot(
+        source_df, row_cols, col_cols, value_col, agg_func, column_kind_map, in_crores, right_total_mode
+    )
+
+    crore_suffix = " (in Cr)" if (in_crores and agg_func != "count") else ""
+    st.markdown(f"**{agg_func.title()} of {value_col}{crore_suffix}**")
+
+    try:
+        num_fmt = "{:,.0f}" if agg_func == "count" else "{:,.2f}"
+
+        def _apply_styles(df: pd.DataFrame) -> pd.DataFrame:
+            styles = pd.DataFrame("", index=df.index, columns=df.columns)
+            for i, (label, is_group) in enumerate(zip(row_labels_for_style, group_row_flags)):
+                if label == "Grand Total":
+                    styles.iloc[i, :] = "font-weight:bold"
+                elif is_group:
+                    styles.iloc[i, :] = "background-color:#dbe5f1; font-weight:bold"
+            for j, is_total in enumerate(total_col_flags):
+                if is_total:
+                    for i in range(len(df)):
+                        existing = styles.iloc[i, j]
+                        styles.iloc[i, j] = f"{existing}; background-color:#f2f2f2; font-weight:bold" if existing else "background-color:#f2f2f2; font-weight:bold"
+            return styles
+
+        row_labels_for_style = list(display_df.index)
+        styler = display_df.style.apply(_apply_styles, axis=None).format(num_fmt)
+        st.dataframe(styler, use_container_width=True)
+    except Exception:
+        # If styling fails for any reason (older pandas/streamlit version, etc.),
+        # fall back to a plain, still-correct, unstyled table rather than crashing.
+        st.dataframe(display_df, use_container_width=True)
+
+    return display_df
+
+
+# --------------------------------------------------------------------------- #
+# General Field Efficiency Table: each cell as a % of the total across every
+# OTHER value of a user-chosen field, holding every other selected Rows/
+# Columns field fixed. Unlike a hardcoded "% of Stage" table, this works for
+# *any* field the user points it at (a Rows field or a Columns field) — pick
+# "STAGE_ECL" to get % of stage-group total per (Zone, Month); pick "zone"
+# instead to get % of zone-group total per (Stage, Month); same formula.
+# --------------------------------------------------------------------------- #
+@st.cache_data(ttl=300, show_spinner=False)
+def build_field_efficiency_pivot(
+    source_df: pd.DataFrame,
+    row_cols: list[str],
+    col_cols: list[str],
+    normalize_field: str,
+    value_col: str,
+    agg_func: str,
+) -> pd.DataFrame:
+    """
+    efficiency(cell) = value(cell) ÷ sum of value across every other value of
+    `normalize_field`, holding every OTHER selected Rows/Columns field fixed.
+
+    E.g. with Rows=[zone], Columns=[STAGE_ECL, value_date], normalize_field=
+    "STAGE_ECL": Stage 1 / East / July = value(Stage1,East,July) ÷
+    [value(Stage1,East,July) + value(Stage2,East,July) + value(Stage3,East,July)].
+    Point it at "zone" instead and it normalizes across zones per (Stage, Month).
+
+    Also appends a "Total" row, "Total" column, and "Total"/"Total" corner
+    cell -- each computed the same correct way as every other cell: sum the
+    RAW value first at that (coarser) level, THEN divide. Never averages the
+    % cells that make it up, which would silently give the wrong number the
+    moment group sizes differ (the classic "ratio of sums" vs "average of
+    ratios" trap).
+
+    Returns a DataFrame shaped like the raw pivot, plus that extra Total row
+    and Total column, every cell already expressed as a % (×100).
+    """
+    all_dims = list(dict.fromkeys([*row_cols, *col_cols]))  # de-dup, preserve order
+    if normalize_field not in all_dims:
+        raise ValueError(f"'{normalize_field}' must be one of the selected Rows/Columns fields.")
+
+    def _efficiency_series(dims: list[str]) -> pd.Series:
+        """
+        Aggregate value_col over `dims` (a subset of all_dims, possibly
+        empty) and express each entry as a % of the sum across every value
+        of normalize_field, holding every OTHER dim in `dims` fixed. If
+        normalize_field isn't part of `dims` at all -- i.e. it's already
+        been collapsed away by moving to a coarser Total level -- every
+        entry is trivially its own 100% (0% if the whole slice is empty).
+        """
+        if not dims:
+            total = source_df[value_col].count() if agg_func == "count" else getattr(source_df[value_col], agg_func)()
+            return pd.Series([100.0 if total else 0.0], index=[0])
+
+        grouped = source_df.groupby(dims, dropna=False)[value_col]
+        leaf = (grouped.count() if agg_func == "count" else grouped.agg(agg_func)).astype(float)
+
+        if normalize_field not in dims:
+            return leaf.where(leaf == 0, 100.0).fillna(0.0)
+
+        other = [d for d in dims if d != normalize_field]
+        denom = leaf.groupby(level=other).transform("sum") if other else pd.Series(leaf.sum(), index=leaf.index)
+        return (leaf.where(denom != 0) / denom.where(denom != 0) * 100.0).fillna(0.0)
+
+    # --- Main cells (unchanged from before) ---
+    cell_eff = _efficiency_series(all_dims)
+    eff_flat = cell_eff.reset_index(name="efficiency_pct")
+    pivot_eff = eff_flat.pivot_table(
+        index=row_cols,
+        columns=col_cols if col_cols else None,
+        values="efficiency_pct",
+        aggfunc="sum",
+        fill_value=0.0,
+    )
+    original_columns = pivot_eff.columns  # capture before appending the Total column
+
+    # --- Total column: collapse every Columns field, keep Rows as-is ---
+    row_margin_eff = _efficiency_series(row_cols)
+    total_col_key = ("Total",) + ("",) * (pivot_eff.columns.nlevels - 1) if isinstance(pivot_eff.columns, pd.MultiIndex) else "Total"
+    pivot_eff[total_col_key] = row_margin_eff.reindex(pivot_eff.index).fillna(0.0).to_numpy()
+
+    # --- Total row: collapse every Rows field, keep Columns as-is, plus the corner cell ---
+    if col_cols:
+        col_margin_eff = _efficiency_series(col_cols).reindex(original_columns).fillna(0.0)
+    else:
+        # No Columns field selected -> original_columns is a single synthetic
+        # column ("efficiency_pct"), not something _efficiency_series([])
+        # (indexed by [0]) can be reindexed against. Broadcast its one
+        # trivial value across that single column instead.
+        col_margin_eff = pd.Series([_efficiency_series([]).iloc[0]] * len(original_columns), index=original_columns)
+    corner_value = _efficiency_series([]).iloc[0]
+
+    total_row_index = pd.Index([("Total",) + ("",) * (pivot_eff.index.nlevels - 1)]) if isinstance(pivot_eff.index, pd.MultiIndex) else pd.Index(["Total"])
+    total_row_values = list(col_margin_eff.to_numpy()) + [corner_value]
+    total_row_df = pd.DataFrame([total_row_values], index=total_row_index, columns=pivot_eff.columns)
+
+    pivot_eff = pd.concat([pivot_eff, total_row_df], axis=0)
+    return pivot_eff
+
+
+def render_field_efficiency_table(
+    source_df: pd.DataFrame,
+    row_cols: list[str],
+    col_cols: list[str],
+    normalize_field: str,
+    value_col: str,
+    agg_func: str,
+) -> pd.DataFrame:
+    """Build the general Field Efficiency table, render it, return it for CSV export."""
+    pivot_eff = build_field_efficiency_pivot(source_df, row_cols, col_cols, normalize_field, value_col, agg_func)
+
+    st.markdown(f"**{agg_func.title()} of {value_col} — % of `{normalize_field}` group total**")
+    st.caption(
+        f"Each cell = its value ÷ the sum across every value of **`{normalize_field}`** for that same "
+        "combination of the other selected Rows/Columns fields — computed automatically for every "
+        "row and column in the table, however many there are. Pick a different field above to "
+        "normalize a different way (e.g. % across zones instead of % across stages). The **Total** "
+        "row/column/corner are computed the same correct way — raw values summed first, then "
+        "divided — not by averaging the % cells."
+    )
+
+    try:
+        def _apply_total_styles(df: pd.DataFrame) -> pd.DataFrame:
+            styles = pd.DataFrame("", index=df.index, columns=df.columns)
+            last_row_label = df.index[-1]
+            last_col_label = df.columns[-1]
+            styles.loc[last_row_label, :] = "background-color:#dbe5f1; font-weight:bold"
+            styles.loc[:, last_col_label] = "background-color:#f2f2f2; font-weight:bold"
+            styles.loc[last_row_label, last_col_label] = "background-color:#c9d6ea; font-weight:bold"
+            return styles
+
+        styler = pivot_eff.style.apply(_apply_total_styles, axis=None).format("{:,.2f}%")
+        st.dataframe(styler, use_container_width=True)
+    except Exception:
+        st.dataframe(pivot_eff, use_container_width=True)
+
+    return pivot_eff
+
 
 def build_pivot_table(
     df: pd.DataFrame,
@@ -928,7 +1363,10 @@ with st.sidebar:
     pivot_col_cols: list[str] = []
     pivot_value_col: str | None = None
     pivot_agg_func: str = "sum"
+    pivot_show_in_crores: bool = False
+    pivot_right_total_mode: str = "grand_total"
     pivot_run_clicked = False
+    pivot_is_built = st.session_state.get(f"pivot_built_{selected_table}", False)
 
     if show_pivot_table:
         numeric_cols = [c for c in column_names if column_kind_map.get(c) == "numeric"]
@@ -965,6 +1403,37 @@ with st.sidebar:
             key=f"pivot_col_cols_{selected_table}",
         )
 
+        if len(pivot_col_cols) >= 2:
+            deepest_label = pivot_col_cols[-1]
+            outer_labels = ", ".join(pivot_col_cols[:-1])
+            right_total_help = {
+                "deepest_field_total": (
+                    f"One '<value> Total' column per {deepest_label} (e.g. one per month), "
+                    f"each summed across every {outer_labels} — the single overall Grand Total "
+                    "column is dropped."
+                ),
+                "grand_total": "The original single 'Grand Total' column, summing everything together.",
+                "both": (
+                    f"The per-{deepest_label} Total columns, plus one overall Grand Total "
+                    "at the very end."
+                ),
+            }
+            pivot_right_total_mode = st.radio(
+                f"↳ Rightmost total column(s) for `{deepest_label}`",
+                options=["deepest_field_total", "grand_total", "both"],
+                format_func=lambda k: {
+                    "deepest_field_total": f"Per-{deepest_label} totals (new)",
+                    "grand_total": "Single overall Grand Total (original)",
+                    "both": "Both",
+                }[k],
+                index=0,
+                key=f"pivot_right_total_mode_{selected_table}",
+                help=right_total_help["deepest_field_total"],
+            )
+            st.caption(right_total_help[pivot_right_total_mode])
+        else:
+            pivot_right_total_mode = "grand_total"
+
         st.markdown("**∑ Values & Aggregation**")
         if numeric_cols:
             pivot_value_col = st.selectbox(
@@ -980,10 +1449,30 @@ with st.sidebar:
             key=f"pivot_agg_func_{selected_table}",
         )
 
-        st.caption("Grand totals (row + column) are added automatically, just like Excel.")
+        if pivot_value_col and pivot_agg_func != "count":
+            crores_pivot_choice = st.radio(
+                f"💰 Display `{pivot_value_col}` in Crores (÷ 1,00,00,000) in the Summary Table?",
+                options=["No", "Yes"],
+                index=0,
+                key=f"pivot_crores_{selected_table}_{pivot_value_col}",
+                horizontal=True,
+            )
+            pivot_show_in_crores = crores_pivot_choice == "Yes"
+
+        st.caption("A Grand Total row is always added. Column totals follow your choice above (if shown).")
         pivot_run_clicked = st.button(
             "🧮 Build Summary", type="primary", use_container_width=True, key=f"pivot_run_{selected_table}"
         )
+        if pivot_run_clicked:
+            # A button's True value only lasts for the one rerun it was clicked
+            # on — the very next rerun (e.g. touching a widget in the ratio
+            # calculator below, or tweaking Rows/Columns) it reports False
+            # again. Persist "this table's pivot has been built" separately so
+            # the whole Summary Table doesn't vanish and reappear stale on
+            # every unrelated interaction; it now stays live and always
+            # reflects the *current* Rows/Columns/Values choices.
+            st.session_state[f"pivot_built_{selected_table}"] = True
+        pivot_is_built = st.session_state.get(f"pivot_built_{selected_table}", False)
 
     st.divider()
     run_clicked = st.button("🚀 Generate Report", type="primary", use_container_width=True)
@@ -1547,8 +2036,8 @@ with tab_pivot:
         st.info("👈 Choose at least one **Rows** column in the sidebar to build a pivot table.")
     elif not pivot_value_col:
         st.info("👈 Choose a numeric **Values** column in the sidebar to aggregate.")
-    elif not pivot_run_clicked:
-        st.info("👈 Configure Filters / Rows / Columns / Values in the sidebar, then click **Build Pivot Table**.")
+    elif not pivot_is_built:
+        st.info("👈 Configure Filters / Rows / Columns / Values in the sidebar, then click **Build Summary** once. It'll then stay live and update automatically as you change your selections or use the calculator below.")
     else:
         try:
             columns_needed = tuple(
@@ -1577,17 +2066,51 @@ with tab_pivot:
                     + (f" × **{', '.join(pivot_col_cols)}**" if pivot_col_cols else "")
                 )
 
-                # --- BEFORE ---
-# st.markdown("#### 📋 Summary Matrix")
-# st.dataframe(pivot_df, use_container_width=True)
-
-# --- AFTER ---
                 st.markdown("#### 📋 Summary Matrix")
+                display_pivot_df = render_excel_style_pivot_table(
+                    pivot_source_df,
+                    pivot_row_cols,
+                    pivot_col_cols,
+                    pivot_value_col,
+                    pivot_agg_func,
+                    column_kind_map,
+                    pivot_show_in_crores,
+                    pivot_right_total_mode,
+                )
 
-# Apply hierarchical layout if multiple row options are selected
-                display_pivot_df = format_hierarchical_pivot(pivot_df) if len(pivot_row_cols) > 1 else pivot_df
-
-                st.dataframe(display_pivot_df, use_container_width=True)
+                available_efficiency_fields = list(dict.fromkeys([*pivot_row_cols, *pivot_col_cols]))
+                if available_efficiency_fields:
+                    st.markdown("#### 🎯 Field Efficiency Table (% of a chosen field's group total)")
+                    st.caption(
+                        "Pick any one of your selected Rows/Columns fields below — the table will show "
+                        "each cell as that field's % share of the total across its own group, holding "
+                        "every other selected field fixed. Works the same way whether you point it at a "
+                        "Rows field or a Columns field."
+                    )
+                    normalize_field = st.selectbox(
+                        "Normalize as % across:",
+                        options=available_efficiency_fields,
+                        key=f"pivot_normalize_field_{selected_table}",
+                    )
+                    efficiency_display_df = render_field_efficiency_table(
+                        pivot_source_df,
+                        pivot_row_cols,
+                        pivot_col_cols,
+                        normalize_field,
+                        pivot_value_col,
+                        pivot_agg_func,
+                    )
+                    efficiency_csv_bytes = efficiency_display_df.to_csv().encode("utf-8-sig")
+                    st.download_button(
+                        "⬇️ Download Field Efficiency Table CSV",
+                        data=efficiency_csv_bytes,
+                        file_name=f"{selected_table}_pivot_efficiency_{normalize_field}.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                        key=f"download_pivot_efficiency_{selected_table}",
+                    )
+                else:
+                    efficiency_display_df = None
 
                 st.markdown("#### 📈 Chart")
                 render_pivot_chart(
@@ -1599,16 +2122,29 @@ with tab_pivot:
                     key_suffix=selected_table,
                 )
 
-                pivot_csv_buffer = io.StringIO()
-                pivot_df.to_csv(pivot_csv_buffer)
-                st.download_button(
-                    "⬇️ Download Pivot CSV",
-                    data=pivot_csv_buffer.getvalue(),
-                    file_name=f"{selected_table}_pivot_summary.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                    key=f"download_pivot_{selected_table}",
-                )
+                dl_col1, dl_col2 = st.columns(2)
+                with dl_col1:
+                    pivot_csv_bytes = pivot_df.to_csv().encode("utf-8-sig")
+                    st.download_button(
+                        "⬇️ Download Pivot CSV (flat)",
+                        data=pivot_csv_bytes,
+                        file_name=f"{selected_table}_pivot_summary.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                        key=f"download_pivot_{selected_table}",
+                    )
+                with dl_col2:
+                    # utf-8-sig adds a BOM so Excel detects UTF-8 correctly instead of
+                    # mangling non-ASCII characters like the "↳" indent arrow.
+                    display_csv_bytes = display_pivot_df.to_csv().encode("utf-8-sig")
+                    st.download_button(
+                        "⬇️ Download Summary Matrix CSV (with subtotals)",
+                        data=display_csv_bytes,
+                        file_name=f"{selected_table}_pivot_excel_style.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                        key=f"download_pivot_excel_style_{selected_table}",
+                    )
         except SQLAlchemyError as exc:
             st.error(f"❌ Failed to fetch data for the pivot table: {exc}")
         except Exception as exc:  # noqa: BLE001

@@ -8,7 +8,6 @@ resulting report with auto-generated KPI cards for numeric columns.
 
 Run with:
     streamlit run app.py
-
 Configuration is read from environment variables (see .env.example / README).
 """
 
@@ -17,6 +16,7 @@ from __future__ import annotations
 import io
 import math
 import os
+import re
 from datetime import date
 from typing import Any
 
@@ -148,7 +148,7 @@ def classify_column(col_type: Any) -> str:
         "DOUBLE",
         "REAL",
         "MONEY",
-        "SERIAL",
+        "SERIAL", 
     )
     if any(marker in type_str for marker in date_markers):
         return "date"
@@ -199,6 +199,8 @@ MONTH_NAMES = [
     "January", "February", "March", "April", "May", "June",
     "July", "August", "September", "October", "November", "December",
 ]
+_MONTH_FULL_TO_NUM = {name: i + 1 for i, name in enumerate(MONTH_NAMES)}
+_MONTH_ABBR_TO_NUM = {name[:3]: i + 1 for i, name in enumerate(MONTH_NAMES)}
 
 # --------------------------------------------------------------------------- #
 # Crore formatting helper
@@ -573,13 +575,91 @@ def _pivot_agg_value(
     return float(getattr(subset, agg_func)())
 
 
+def _month_sort_key(value: Any) -> tuple[int, int, str] | None:
+    """
+    If `value` looks like a month name someone typed/stored as plain text —
+    'January', 'Jan', 'January 2024', 'Jan-24', 'Jan 24' — return a
+    (year, month, text) key so it sorts chronologically (Jan -> Dec, and by
+    year first if a year is present) instead of alphabetically. Returns None
+    for anything that doesn't look like a month value, so normal columns are
+    completely unaffected.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    match = re.match(r"^([A-Za-z]+)[\s\-,]*(\d{2,4})?$", text)
+    if not match:
+        return None
+    month_part, year_part = match.group(1), match.group(2)
+    month_num = _MONTH_FULL_TO_NUM.get(month_part.title()) or _MONTH_ABBR_TO_NUM.get(month_part[:3].title())
+    if month_num is None:
+        return None
+    if year_part:
+        year_num = int(year_part)
+        if year_num < 100:  # 2-digit year, e.g. "24" -> 2024
+            year_num += 2000
+    else:
+        year_num = 0  # no year given -> just order Jan..Dec
+    return (year_num, month_num, text)
+
+
 def _ordered_unique(series: pd.Series) -> list[Any]:
-    """Distinct non-null values, sorted when possible (falls back to first-seen order)."""
+    """
+    Distinct non-null values, sorted when possible. If EVERY value in the
+    column looks like a month name (plain text, not a real date/timestamp
+    column — those are already handled separately and sort correctly), sort
+    chronologically (January -> December, and by year first if present)
+    instead of alphabetically. Otherwise falls back to a normal sort, or
+    first-seen order if the values aren't sortable at all.
+    """
     vals = [v for v in pd.unique(series) if pd.notna(v)]
+    if not vals:
+        return vals
+    month_keys = [_month_sort_key(v) for v in vals]
+    if all(k is not None for k in month_keys):
+        return [v for _, v in sorted(zip(month_keys, vals), key=lambda pair: pair[0])]
     try:
         return sorted(vals)
     except TypeError:
         return vals
+
+
+def _reorder_axis_chronologically(idx: pd.Index) -> pd.Index:
+    """
+    Reorder a (possibly MultiIndex) pandas axis so any month-like level
+    sorts chronologically instead of alphabetically — the exact same rule
+    `_ordered_unique` applies to the main Summary Matrix — while pinning a
+    literal 'Total' entry at that level to the very end. Non-month levels
+    keep their existing order untouched. Used for tables (like the Field
+    Efficiency Table) that are built via pandas groupby/pivot_table instead
+    of the row/column tree builder, so they still need this applied
+    separately after the fact.
+    """
+    is_multi = isinstance(idx, pd.MultiIndex)
+    n_levels = idx.nlevels if is_multi else 1
+    tuples = list(idx) if is_multi else [(v,) for v in idx]
+
+    level_ranks: list[dict[Any, int]] = []
+    for level in range(n_levels):
+        non_total_vals = [t[level] for t in tuples if t[level] not in ("Total", "")]
+        ordered_vals = _ordered_unique(pd.Series(non_total_vals)) if non_total_vals else []
+        level_ranks.append({v: i for i, v in enumerate(ordered_vals)})
+
+    def _sort_key(t: tuple) -> tuple:
+        key = []
+        for level in range(n_levels):
+            v = t[level]
+            key.append((1, 0) if v in ("Total", "") else (0, level_ranks[level].get(v, 0)))
+        return tuple(key)
+
+    order = sorted(range(len(tuples)), key=lambda i: _sort_key(tuples[i]))
+    new_tuples = [tuples[i] for i in order]
+
+    if is_multi:
+        return pd.MultiIndex.from_tuples(new_tuples, names=idx.names)
+    return pd.Index([t[0] for t in new_tuples], name=idx.name)
 
 
 def _build_row_entries(
@@ -934,6 +1014,12 @@ def build_field_efficiency_pivot(
     total_row_df = pd.DataFrame([total_row_values], index=total_row_index, columns=pivot_eff.columns)
 
     pivot_eff = pd.concat([pivot_eff, total_row_df], axis=0)
+
+    # Same chronological-month ordering as the Summary Matrix above, applied
+    # here too since this table is built via groupby/pivot_table rather than
+    # the row/column tree builder that already handles it.
+    pivot_eff = pivot_eff.reindex(index=_reorder_axis_chronologically(pivot_eff.index))
+    pivot_eff = pivot_eff.reindex(columns=_reorder_axis_chronologically(pivot_eff.columns))
     return pivot_eff
 
 
@@ -1435,14 +1521,11 @@ with st.sidebar:
             pivot_right_total_mode = "grand_total"
 
         st.markdown("**∑ Values & Aggregation**")
-        if numeric_cols:
-            pivot_value_col = st.selectbox(
-                "Numeric column to aggregate (e.g. GA in Crs)",
-                options=numeric_cols,
-                key=f"pivot_value_col_{selected_table}",
-            )
-        else:
-            st.warning("No numeric columns found in this table to aggregate.")
+        pivot_value_col = st.selectbox(
+            "Column to aggregate",
+            options=column_names,
+            key=f"pivot_value_col_{selected_table}",
+        )
         pivot_agg_func = st.selectbox(
             "Aggregation function",
             options=PIVOT_AGG_FUNCS,
@@ -2167,8 +2250,8 @@ with tab_sql:
                 
                 st.success(f"Query returned **{len(custom_df):,}** row(s).")
                 st.dataframe(custom_df, use_container_width=True, height=400)
-                
-                # Dynamic CSV Download for Custom Queries
+
+                    
                 custom_csv = io.StringIO()
                 custom_df.to_csv(custom_csv, index=False)
                 st.download_button(

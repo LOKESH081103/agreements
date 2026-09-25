@@ -27,7 +27,8 @@ import re
 import time
 from datetime import date
 from typing import Any, Callable
-
+from dotenv import load_dotenv
+load_dotenv()
 import numpy as np
 import pandas as pd
 import xlsxwriter

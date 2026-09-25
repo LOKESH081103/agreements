@@ -29,7 +29,8 @@ import os
 import secrets as pysecrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
-
+from dotenv import load_dotenv
+load_dotenv()
 import jwt
 import pandas as pd
 from fastapi import Depends, FastAPI, HTTPException, Security

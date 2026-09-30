@@ -1,0 +1,45 @@
+[PIVOT_PROFILE] stage=db_query_and_dataframe_fetch elapsed_s=3.604 groups=35782 measures=18
+[PIVOT_PROFILE] stage=fetch_call_including_cache elapsed_s=5.164 values=18 groups_by_value={'april_25': 35782, 'may_25': 35782, 'june_25': 35782, 'july_25': 35782, 'august_25': 35782, 'september_25': 35782, 'november_25': 35782, 'october_25': 35782, 'december_25': 35782, 'january_26': 35782, 'february_26': 35782, 'march_25': 35782, 'march_26': 35782, 'april_26': 35782, 'may_26': 35782, 'june_26': 35782, 'july_26': 35782, 'august_26': 35782}
+2026-09-30 11:04:13.435 Please replace `use_container_width` with `width`.
+
+`use_container_width` will be removed after 2025-12-31.
+
+For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
+2026-09-30 11:04:13.456 Please replace `use_container_width` with `width`.
+
+`use_container_width` will be removed after 2025-12-31.
+
+For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
+[PIVOT_PROFILE] stage=fetch_call_including_cache elapsed_s=0.792 values=18 groups_by_value={'april_25': 35782, 'may_25': 35782, 'june_25': 35782, 'july_25': 35782, 'august_25': 35782, 'september_25': 35782, 'november_25': 35782, 'october_25': 35782, 'december_25': 35782, 'january_26': 35782, 'february_26': 35782, 'march_25': 35782, 'march_26': 35782, 'april_26': 35782, 'may_26': 35782, 'june_26': 35782, 'july_26': 35782, 'august_26': 35782}
+2026-09-30 11:04:14.724 Please replace `use_container_width` with `width`.
+
+`use_container_width` will be removed after 2025-12-31.
+
+For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
+2026-09-30 11:04:14.740 Please replace `use_container_width` with `width`.
+
+`use_container_width` will be removed after 2025-12-31.
+
+For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
+[PIVOT_PROFILE] stage=fetch_call_including_cache elapsed_s=0.607 values=18 groups_by_value={'april_25': 35782, 'may_25': 35782, 'june_25': 35782, 'july_25': 35782, 'august_25': 35782, 'september_25': 35782, 'november_25': 35782, 'october_25': 35782, 'december_25': 35782, 'january_26': 35782, 'february_26': 35782, 'march_25': 35782, 'march_26': 35782, 'april_26': 35782, 'may_26': 35782, 'june_26': 35782, 'july_26': 35782, 'august_26': 35782}
+[PIVOT_PROFILE] stage=python_measure_pivot_build elapsed_s=9.249 measure='april_25' rows=8529 columns=28
+[PIVOT_PROFILE] stage=python_measure_pivot_build elapsed_s=7.819 measure='may_25' rows=8529 columns=28
+[PIVOT_PROFILE] stage=python_measure_pivot_build elapsed_s=7.988 measure='june_25' rows=8529 columns=28
+[PIVOT_PROFILE] stage=python_measure_pivot_build elapsed_s=8.141 measure='july_25' rows=8529 columns=28
+[PIVOT_PROFILE] stage=python_measure_pivot_build elapsed_s=7.732 measure='august_25' rows=8529 columns=28
+[PIVOT_PROFILE] stage=python_measure_pivot_build elapsed_s=7.847 measure='september_25' rows=8529 columns=28
+[PIVOT_PROFILE] stage=python_measure_pivot_build elapsed_s=7.843 measure='november_25' rows=8529 columns=28
+[PIVOT_PROFILE] stage=python_measure_pivot_build elapsed_s=7.758 measure='october_25' rows=8529 columns=28
+[PIVOT_PROFILE] stage=python_measure_pivot_build elapsed_s=7.699 measure='december_25' rows=8529 columns=28
+[PIVOT_PROFILE] stage=python_measure_pivot_build elapsed_s=7.554 measure='january_26' rows=8529 columns=28
+[PIVOT_PROFILE] stage=python_measure_pivot_build elapsed_s=8.267 measure='february_26' rows=8529 columns=28
+[PIVOT_PROFILE] stage=python_measure_pivot_build elapsed_s=8.734 measure='march_25' rows=8529 columns=28
+[PIVOT_PROFILE] stage=python_measure_pivot_build elapsed_s=8.369 measure='march_26' rows=8529 columns=28
+[PIVOT_PROFILE] stage=python_measure_pivot_build elapsed_s=7.682 measure='april_26' rows=8529 columns=28
+[PIVOT_PROFILE] stage=python_measure_pivot_build elapsed_s=8.134 measure='may_26' rows=8529 columns=28
+[PIVOT_PROFILE] stage=python_measure_pivot_build elapsed_s=8.284 measure='june_26' rows=8529 columns=28
+[PIVOT_PROFILE] stage=python_measure_pivot_build elapsed_s=8.405 measure='july_26' rows=8529 columns=28
+[PIVOT_PROFILE] stage=python_measure_pivot_build elapsed_s=7.915 measure='august_26' rows=8529 columns=28
+[PIVOT_PROFILE] stage=python_pivot_build_total elapsed_s=146.087 measures=18 rows=8529 columns=504 cells=4298616
+[PIVOT_PROFILE] stage=grid_prepare elapsed_s=3.232 rows=8529 columns=504
+[PIVOT_PROFILE] stage=aggrid_server_call elapsed_s=0.646 rows=8529 columns=504
